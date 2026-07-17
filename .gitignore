@@ -1,0 +1,13 @@
+Node/OS artifacts
+node_modules/
+.env
+.env.*
+*.log
+.DS_Store
+Thumbs.db
+
+Editor
+.vscode/
+.idea/
+
+Build output (none by default)
