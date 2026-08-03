@@ -1,5 +1,10 @@
 # Sources
 
+These are background references for the conceptual architecture only. They do
+not validate the software reservoir, establish biological safety limits, or
+authorize physical implementation. Verify current claims against the primary
+publication or organization before relying on them.
+
 ## Core Review Paper
 - **Talavera, Y. & Ulmann, B.** (2025). *Brain Organoid Computing – an Overview.* arXiv:2503.19770 (cs.ET)  
   https://arxiv.org/abs/2503.19770 — Foundational overview covering characteristics, challenges, and advantages of organoid computing.
