@@ -5,12 +5,14 @@ import json
 import math
 
 from .metrics import summarize_spikes
-from .model import ReservoirConfig, SpikingReservoir
+from .model import MAX_SIMULATION_FRAMES, ReservoirConfig, SpikingReservoir
 
 
 def simulate(steps: int = 120, seed: int = 7) -> dict:
     if steps <= 0:
         raise ValueError("steps must be positive")
+    if steps > MAX_SIMULATION_FRAMES:
+        raise ValueError(f"steps exceed the {MAX_SIMULATION_FRAMES}-frame simulation limit")
     config = ReservoirConfig(neuron_count=24, input_channels=2, seed=seed, noise_std=0.0, connection_probability=0.15, input_gain=20.0)
     reservoir = SpikingReservoir(config)
     # Use a positive synthetic drive so the demo visibly exercises spike output;
