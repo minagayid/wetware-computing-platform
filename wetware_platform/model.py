@@ -14,8 +14,19 @@ import random
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 
+MAX_NEURON_COUNT = 512
+MAX_INPUT_WEIGHT_COUNT = 1_000_000
+MAX_SIMULATION_FRAMES = 100_000
+MAX_SIMULATION_SAMPLES = 1_000_000
+MAX_SIMULATION_OPERATIONS = 100_000_000
+MAX_RECORDED_SPIKES = 1_000_000
+
+
 def _finite(value: float, name: str) -> float:
-    value = float(value)
+    try:
+        value = float(value)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError(f"{name} must be finite") from None
     if not math.isfinite(value):
         raise ValueError(f"{name} must be finite")
     return value
@@ -43,8 +54,12 @@ class ReservoirConfig:
     def __post_init__(self) -> None:
         if int(self.neuron_count) != self.neuron_count or self.neuron_count <= 0:
             raise ValueError("neuron_count must be a positive integer")
+        if self.neuron_count > MAX_NEURON_COUNT:
+            raise ValueError(f"neuron_count exceeds the local simulation limit of {MAX_NEURON_COUNT}")
         if int(self.input_channels) != self.input_channels or self.input_channels <= 0:
             raise ValueError("input_channels must be a positive integer")
+        if self.neuron_count * self.input_channels > MAX_INPUT_WEIGHT_COUNT:
+            raise ValueError(f"neuron_count * input_channels exceeds {MAX_INPUT_WEIGHT_COUNT}")
         for name in ("dt_ms", "membrane_tau_ms", "synaptic_tau_ms", "refractory_ms", "max_weight"):
             if _finite(getattr(self, name), name) <= 0.0:
                 raise ValueError(f"{name} must be positive")
@@ -101,8 +116,25 @@ class SpikingReservoir:
         config = self.config if seed is None else ReservoirConfig(**{**asdict(self.config), "seed": int(seed)})
         self.__init__(config)
 
+    def _worst_case_operations_per_step(self, enable_plasticity: bool = True) -> int:
+        edge_count = sum(len(row) for row in self.weights)
+        traversals_per_edge = 3 if enable_plasticity else 1
+        return (
+            self.config.neuron_count * self.config.input_channels
+            + traversals_per_edge * edge_count
+        )
+
     def step(self, input_values: Sequence[float], enable_plasticity: bool = True) -> List[Spike]:
-        values = tuple(float(value) for value in input_values)
+        values = []
+        iterator = iter(input_values)
+        for _ in range(self.config.input_channels + 1):
+            try:
+                value = next(iterator)
+            except StopIteration:
+                break
+            if len(values) >= self.config.input_channels:
+                raise ValueError(f"expected {self.config.input_channels} input channels")
+            values.append(float(value))
         if len(values) != self.config.input_channels:
             raise ValueError(f"expected {self.config.input_channels} input channels")
         if not all(math.isfinite(value) for value in values):
@@ -167,8 +199,29 @@ class SpikingReservoir:
 
     def run(self, frames: Iterable[Sequence[float]], enable_plasticity: bool = True) -> List[Spike]:
         spikes: List[Spike] = []
+        frame_count = 0
+        operations_per_step = self._worst_case_operations_per_step(enable_plasticity)
         for frame in frames:
-            spikes.extend(self.step(frame, enable_plasticity=enable_plasticity))
+            if frame_count >= MAX_SIMULATION_FRAMES:
+                raise ValueError(f"simulation exceeds the {MAX_SIMULATION_FRAMES}-frame limit")
+            next_frame_count = frame_count + 1
+            if next_frame_count * self.config.input_channels > MAX_SIMULATION_SAMPLES:
+                raise ValueError(f"simulation exceeds the {MAX_SIMULATION_SAMPLES}-sample limit")
+            if next_frame_count * operations_per_step > MAX_SIMULATION_OPERATIONS:
+                raise ValueError(f"simulation exceeds the {MAX_SIMULATION_OPERATIONS}-operation limit")
+            rollback_snapshot = (
+                self.snapshot()
+                if len(spikes) + self.config.neuron_count > MAX_RECORDED_SPIKES
+                else None
+            )
+            frame_spikes = self.step(frame, enable_plasticity=enable_plasticity)
+            if len(spikes) + len(frame_spikes) > MAX_RECORDED_SPIKES:
+                if rollback_snapshot is not None:
+                    restored = type(self).from_snapshot(rollback_snapshot)
+                    self.__dict__.update(restored.__dict__)
+                raise ValueError(f"simulation exceeds the {MAX_RECORDED_SPIKES}-spike output limit")
+            spikes.extend(frame_spikes)
+            frame_count += 1
         return spikes
 
     def weights_snapshot(self) -> List[Dict[int, float]]:
@@ -180,13 +233,13 @@ class SpikingReservoir:
             "config": asdict(self.config),
             "time_ms": self.time_ms,
             "step_index": self.step_index,
-            "input_weights": self.input_weights,
+            "input_weights": [list(row) for row in self.input_weights],
             "weights": self.weights_snapshot(),
-            "membrane": self.membrane,
-            "refractory_until": self.refractory_until,
-            "pending_current": self.pending_current,
-            "pre_trace": self.pre_trace,
-            "post_trace": self.post_trace,
+            "membrane": list(self.membrane),
+            "refractory_until": list(self.refractory_until),
+            "pending_current": list(self.pending_current),
+            "pre_trace": list(self.pre_trace),
+            "post_trace": list(self.post_trace),
             "rng_state": _to_jsonable(self._rng.getstate()),
         }
 
@@ -210,7 +263,26 @@ class SpikingReservoir:
             raise ValueError("snapshot input_weights has wrong channel count")
         if not all(math.isfinite(value) for row in reservoir.input_weights for value in row):
             raise ValueError("snapshot contains non-finite input weights")
-        reservoir.weights = [{int(target): reservoir._bounded_weight(float(weight)) for target, weight in row.items()} for row in snapshot["weights"]]
+        raw_weights = snapshot["weights"]
+        if not isinstance(raw_weights, list) or len(raw_weights) != n:
+            raise ValueError("snapshot field has wrong length: weights")
+        normalized_weights = []
+        for source, row in enumerate(raw_weights):
+            if not isinstance(row, dict) or len(row) > n - 1:
+                raise ValueError(f"snapshot weight row {source} is malformed or too large")
+            normalized_row = {}
+            for raw_target, raw_weight in row.items():
+                if isinstance(raw_target, bool) or not isinstance(raw_target, (str, int)):
+                    raise ValueError("snapshot contains an invalid synapse target")
+                try:
+                    target = int(raw_target)
+                except (OverflowError, TypeError, ValueError):
+                    raise ValueError("snapshot contains an invalid synapse target") from None
+                if not 0 <= target < n or target == source or target in normalized_row:
+                    raise ValueError("snapshot contains an invalid synapse")
+                normalized_row[target] = reservoir._bounded_weight(_finite(raw_weight, "snapshot synapse weight"))
+            normalized_weights.append(normalized_row)
+        reservoir.weights = normalized_weights
         reservoir.incoming = [[] for _ in range(n)]
         for source, row in enumerate(reservoir.weights):
             for target in row:
